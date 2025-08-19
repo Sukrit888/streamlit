@@ -1,0 +1,155 @@
+import streamlit as st
+import pandas as pd
+import random
+import numpy as np
+
+# --- Configuration ---
+# The app will look for this file in the same directory.
+DATA_FILE = "16 July, 2024.xlsx"
+
+@st.cache_data
+def load_data(file_path):
+    """Loads data from a local Excel file and caches it."""
+    try:
+        df = pd.read_excel(file_path)
+        # --- Data Preprocessing ---
+        df['create_date'] = pd.to_datetime(df['create_date'])
+        df['update_date'] = pd.to_datetime(df['update_date'])
+        df['date_only'] = df['create_date'].dt.date
+        return df
+    except FileNotFoundError:
+        st.error(f"Error: The data file '{file_path}' was not found.")
+        st.warning("Please make sure the Excel file is in the same GitHub repository as the app.py file.")
+        return None
+    except Exception as e:
+        st.error(f"An error occurred while loading the data: {e}")
+        return None
+
+def classify_lcvs_equally(lcv_ids):
+    """
+    Classifies a list of LCV IDs into three stages as equally as possible.
+    """
+    stages = ['Empty - Waiting Area', 'Filling – Safe Zone', 'Filled – Waiting Area/Moving to DBS']
+    classification = {}
+    
+    # Get unique, non-null LCVs and shuffle them for random distribution
+    unique_lcvs = [lcv for lcv in lcv_ids.unique() if pd.notna(lcv)]
+    random.shuffle(unique_lcvs)
+    
+    # Split the LCVs into three roughly equal parts
+    lcv_splits = np.array_split(unique_lcvs, 3)
+    
+    # Assign each split to a stage
+    for i, stage in enumerate(stages):
+        for lcv_id in lcv_splits[i]:
+            classification[lcv_id] = stage
+            
+    return classification
+
+def allocate_lcv_to_route(selected_data, available_lcvs_in_stage):
+    """
+    Allocates an optimal LCV from a specific stage to a route, prioritizing 
+    the route with the maximum duration.
+    """
+    sorted_routes = selected_data.sort_values(by='Duration', ascending=False)
+    
+    # Use a copy to track available LCVs for this allocation session
+    lcvs_to_allocate = list(available_lcvs_in_stage)
+    
+    allocations = []
+
+    if not lcvs_to_allocate:
+        st.warning("No LCVs available in the selected stage for allocation.")
+        return pd.DataFrame()
+
+    for index, route in sorted_routes.iterrows():
+        if lcvs_to_allocate:
+            # Take the next available LCV from the list
+            optimal_lcv = lcvs_to_allocate.pop(0)
+            
+            allocations.append({
+                'request_id': route['Request_id'],
+                'Route_id': route['Route_id'],
+                'DBS': route['DBS'],
+                'Distance': route['Distance'],
+                'Duration': route['Duration'],
+                'Allocated_LCV': optimal_lcv,
+            })
+        else:
+            # Ran out of LCVs in the selected stage
+            allocations.append({
+                'request_id': route['Request_id'],
+                'Route_id': route['Route_id'],
+                'DBS': route['DBS'],
+                'Distance': route['Distance'],
+                'Duration': route['Duration'],
+                'Allocated_LCV': 'No LCV Available in Stage',
+            })
+            
+    return pd.DataFrame(allocations)
+
+# --- App Layout ---
+st.set_page_config(layout="wide")
+st.title('🚚 LCV Route Allocation Dashboard')
+
+df = load_data(DATA_FILE)
+
+if df is not None:
+    st.sidebar.header('Filter Options')
+
+    # --- User Inputs in Sidebar ---
+    unique_dates = sorted(df['date_only'].unique())
+    selected_date = st.sidebar.selectbox('Select Date', options=unique_dates)
+
+    df_filtered_date = df[df['date_only'] == selected_date]
+
+    unique_mgs = df_filtered_date['MGS'].unique()
+    selected_mgs = st.sidebar.multiselect('Select MGS', options=unique_mgs, default=list(unique_mgs))
+
+    df_filtered_mgs = df_filtered_date[df_filtered_date['MGS'].isin(selected_mgs)]
+
+    unique_request_ids = df_filtered_mgs['Request_id'].unique()
+    selected_request_ids = st.multiselect('Select Request IDs to Allocate', options=unique_request_ids)
+
+    # --- LCV Classification (in the background) ---
+    all_lcvs = df['lcv_id']
+    lcv_stages_classification = classify_lcvs_equally(all_lcvs)
+    
+    stage1_lcvs = [lcv for lcv, stage in lcv_stages_classification.items() if stage == 'Empty - Waiting Area']
+    stage2_lcvs = [lcv for lcv, stage in lcv_stages_classification.items() if stage == 'Filling – Safe Zone']
+    stage3_lcvs = [lcv for lcv, stage in lcv_stages_classification.items() if stage == 'Filled – Waiting Area/Moving to DBS']
+    
+    # --- Display Selected Request Details & Get Stage Input ---
+    if selected_request_ids:
+        st.header("Selected Route Details")
+        selected_data = df_filtered_mgs[df_filtered_mgs['Request_id'].isin(selected_request_ids)]
+        
+        display_columns = ['Request_id', 'DBS', 'Route_id', 'Distance', 'Duration', 'create_date', 'update_date']
+        st.dataframe(selected_data[display_columns].reset_index(drop=True))
+
+        st.header("Allocation Options")
+        
+        # --- User Input for Stage ---
+        stage_options = {
+            "Stage 1: Empty - Waiting Area": stage1_lcvs,
+            "Stage 2: Filling – Safe Zone": stage2_lcvs,
+            "Stage 3: Filled – Waiting Area/Moving to DBS": stage3_lcvs
+        }
+        selected_stage_name = st.selectbox(
+            'Select a Stage to allocate LCVs from',
+            options=list(stage_options.keys())
+        )
+        
+        # --- Display Available LCVs for that Stage ---
+        available_lcvs_for_stage = stage_options[selected_stage_name]
+        st.write(f"**LCVs available in {selected_stage_name}:**")
+        st.write(available_lcvs_for_stage)
+
+        # --- Allocation Logic ---
+        if st.button('Allocate LCVs to Selected Routes', key='allocate_button'):
+            st.header("Optimal LCV Allocation")
+            allocation_result = allocate_lcv_to_route(selected_data, available_lcvs_for_stage)
+            
+            if not allocation_result.empty:
+                st.write(f"Allocation based on prioritizing the longest duration route, using LCVs from **{selected_stage_name}**.")
+                st.dataframe(allocation_result)
